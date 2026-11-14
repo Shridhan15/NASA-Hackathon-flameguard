@@ -2,7 +2,7 @@ import logging
 import os
 from pathlib import Path
 from typing import List, Literal, Optional
-
+import re
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -64,7 +64,17 @@ PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("
 IMAGES_DIR = Path(__file__).resolve().parent.parent / "data" / "images"
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 app.mount("/static_images", StaticFiles(directory=IMAGES_DIR), name="static_images")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "http://127.0.0.1:8000").rstrip("/")
 
+def rewrite_image_urls(text: str) -> str:
+    if not text:
+        return text
+    # Matches optional ./ or backend/, data/images/ or data\images\, and rewrites to PUBLIC_BASE_URL/static_images/
+    return re.sub(
+        r'(?:\./|backend[\\/])?data[\\/]images[\\/]',
+        f"{PUBLIC_BASE_URL}/static_images/",
+        text,
+    )
 
 def _tokens(text: str) -> List[str]:
     return tokenize(text)
