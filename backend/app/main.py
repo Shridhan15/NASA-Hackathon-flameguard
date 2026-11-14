@@ -128,14 +128,50 @@ def _result_key(text: str) -> str:
 
 # Initialize Embeddings and Vector Store
 
-print("Loading HuggingFace Inference for retrieval...")
-try:
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-    vectorstore = PineconeVectorStore(index_name=INDEX_NAME, embedding=embeddings)
-except Exception as exc:
-    logger.error("Vector store initialization failed, curated PSI records remain available: %s", exc)
-    embeddings = None
-    vectorstore = None
+
+import threading
+
+# Lazy initialization: no model download during server startup
+embeddings = None
+vectorstore = None
+vectorstore_initialized = False
+vectorstore_lock = threading.Lock()
+
+
+def get_vectorstore():
+    global embeddings, vectorstore, vectorstore_initialized
+
+    if vectorstore_initialized:
+        return vectorstore
+
+    with vectorstore_lock:
+        if vectorstore_initialized:
+            return vectorstore
+
+        try:
+            if embeddings is None:
+                logger.info("Loading HuggingFace embedding model...")
+
+                embeddings = HuggingFaceEmbeddings(
+                    model_name="sentence-transformers/all-MiniLM-L6-v2",
+                    model_kwargs={"device": "cpu"},
+                    encode_kwargs={"normalize_embeddings": True}
+                )
+
+            vectorstore = PineconeVectorStore(
+                index_name=INDEX_NAME,
+                embedding=embeddings
+            )
+
+            vectorstore_initialized = True
+            logger.info("Pinecone vector store initialized successfully.")
+
+        except Exception:
+            logger.exception("Vector store initialization failed.")
+            vectorstore = None
+
+    return vectorstore
+
 
 # 4. Initialize the Groq LLM (Llama 3)
 primary_llm = ChatGroq(
@@ -220,7 +256,7 @@ class SearchResponse(BaseModel):
 # --- API Endpoints ---
 @app.post("/api/search", response_model=SearchResponse)
 @limiter.limit("5/minute") # Apply Rate Limit: 5 requests per minute per IP
-async def search_combustion_data(request: Request, search_query: SearchRequest):
+def search_combustion_data(request: Request, search_query: SearchRequest):
     try:
         fuel_filter = normalize_fuel(search_query.fuel_filter)
         mission = normalize_mission(search_query.mission)
@@ -237,7 +273,9 @@ async def search_combustion_data(request: Request, search_query: SearchRequest):
             seen = {_result_key(result.text) for result in merged_results}
 
         # B. Pinecone fills the slots (or handles the entire query if a section is provided)
-        if vectorstore is not None:
+        current_vectorstore = get_vectorstore()
+
+        if current_vectorstore is not None:
             try:
                 search_kwargs = {"k": top_k}
                 pinecone_filter = {}
@@ -252,13 +290,15 @@ async def search_combustion_data(request: Request, search_query: SearchRequest):
                 
                 if search_query.environment:
                     # Pinecone checks if this string exists inside the metadata array
-                    pinecone_filter["environments"] = search_query.environment
+                    pinecone_filter["environments"] = {
+                        "$in": [search_query.environment]
+                    }
                 
                 # Only pass the filter argument to Pinecone if it contains keys
                 if pinecone_filter:
                     search_kwargs["filter"] = pinecone_filter
 
-                docs = vectorstore.similarity_search(search_query.query, **search_kwargs)
+                docs = current_vectorstore.similarity_search(search_query.query, **search_kwargs)
 
                 for doc in docs:
                     # Skip mission/pillar matching for non-PSI sections (like Apollo 1)
@@ -326,10 +366,14 @@ async def search_combustion_data(request: Request, search_query: SearchRequest):
             "retrieved_chunks": formatted_results,
             "context_text": context_text,
             "environment_filter": search_query.environment,
-            "section": search_query.section
+            "section": search_query.section,
+            "is_safe": True,
+            "active_source": "pinecone",
+            "synthesized_answer": ""
         })
         
         synthesized_text = graph_result.get("synthesized_answer", "")
+
         if synthesized_text:
             print("LangGraph SI response generated successfully.")
 
